@@ -1,0 +1,238 @@
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import random
+import sqlite3
+import os
+
+# ================== НАСТРОЙКИ ==================
+TOKEN = os.getenv("BOT_TOKEN")  # токен из Railway
+START_BALANCE = 100_000
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher(bot)
+
+# ================== БАЗА ДАННЫХ ==================
+db = sqlite3.connect("game.db")
+cur = db.cursor()
+
+cur.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER)")
+cur.execute("CREATE TABLE IF NOT EXISTS duels (challenger INTEGER PRIMARY KEY, stake INTEGER)")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS mines (
+    user_id INTEGER PRIMARY KEY,
+    cells TEXT,
+    opened TEXT,
+    stake INTEGER,
+    multiplier REAL
+)
+""")
+db.commit()
+
+# ================== БАЛАНС ==================
+def get_balance(uid):
+    cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO users VALUES (?, ?)", (uid, START_BALANCE))
+        db.commit()
+        return START_BALANCE
+    return row[0]
+
+def set_balance(uid, bal):
+    cur.execute("UPDATE users SET balance=? WHERE user_id=?", (bal, uid))
+    db.commit()
+
+# ================== МЕНЮ ==================
+def menu():
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("🎲 Кости", callback_data="dice"),
+        InlineKeyboardButton("💣 Минное поле", callback_data="mine"),
+        InlineKeyboardButton("💰 Баланс", callback_data="balance")
+    )
+    return kb
+
+def mine_keyboard(opened):
+    kb = InlineKeyboardMarkup(row_width=5)
+    for i in range(25):
+        emoji = "✅" if str(i) in opened else "⬜"
+        kb.insert(InlineKeyboardButton(emoji, callback_data=f"mine_{i}"))
+    kb.add(InlineKeyboardButton("🏁 Забрать", callback_data="mine_exit"))
+    return kb
+
+# ================== СТАРТ ==================
+@dp.message_handler(commands=["start"])
+async def start(msg: types.Message):
+    bal = get_balance(msg.from_user.id)
+    await msg.reply(
+        f"🎮 Добро пожаловать, {msg.from_user.first_name}!\n"
+        f"💰 Баланс: {bal}",
+        reply_markup=menu()
+    )
+
+# ================== КОСТИ ==================
+async def play_dice(msg, uid, stake):
+    bal = get_balance(uid)
+    if stake > bal:
+        await msg.reply("❌ Недостаточно валюты")
+        return
+    roll = random.randint(1, 6)
+    if roll >= 4:
+        bal += stake
+        text = f"🎲 {roll} — Победа +{stake} 💰"
+    else:
+        bal -= stake
+        text = f"🎲 {roll} — Проигрыш -{stake} 💰"
+    set_balance(uid, bal)
+    await msg.reply(f"{text}\nБаланс: {bal}", reply_markup=menu())
+
+@dp.message_handler(lambda m: m.text and m.text.lower().startswith("кости"))
+async def dice_text(msg: types.Message):
+    parts = msg.text.split()
+    stake = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 10
+    await play_dice(msg, msg.from_user.id, stake)
+
+# ================== ДУЭЛИ ==================
+@dp.message_handler(lambda m: m.text and m.text.lower().startswith("дуэль"))
+async def duel(msg: types.Message):
+    parts = msg.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await msg.reply("Используй: дуэль 1000")
+        return
+    stake = int(parts[1])
+    uid = msg.from_user.id
+    if stake > get_balance(uid):
+        await msg.reply("❌ Недостаточно валюты")
+        return
+    cur.execute("REPLACE INTO duels VALUES (?, ?)", (uid, stake))
+    db.commit()
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("✅ Принять", callback_data=f"accept_{uid}")
+    )
+    await msg.reply(f"🎲 Дуэль! Ставка {stake} 💰", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("accept_"))
+async def duel_accept(call: types.CallbackQuery):
+    challenger = int(call.data.split("_")[1])
+    opponent = call.from_user.id
+    cur.execute("SELECT stake FROM duels WHERE challenger=?", (challenger,))
+    row = cur.fetchone()
+    if not row:
+        return
+    stake = row[0]
+    if get_balance(opponent) < stake:
+        await call.answer("Недостаточно")
+        return
+    d1, d2 = random.randint(1, 6), random.randint(1, 6)
+    if d1 > d2:
+        set_balance(challenger, get_balance(challenger) + stake)
+        set_balance(opponent, get_balance(opponent) - stake)
+        res = "🏆 Победил вызвавший"
+    elif d2 > d1:
+        set_balance(opponent, get_balance(opponent) + stake)
+        set_balance(challenger, get_balance(challenger) - stake)
+        res = "🏆 Победил принявший"
+    else:
+        res = "🤝 Ничья"
+    cur.execute("DELETE FROM duels WHERE challenger=?", (challenger,))
+    db.commit()
+    await call.message.reply(f"{res} ({d1}:{d2})")
+
+# ================== МИННОЕ ПОЛЕ 5x5 ==================
+def new_mines(uid, stake):
+    cells = ["safe"] * 25
+    for i in random.sample(range(25), 5):
+        cells[i] = "mine"
+    cur.execute(
+        "REPLACE INTO mines VALUES (?, ?, ?, ?, ?)",
+        (uid, ",".join(cells), "", stake, 1.0)
+    )
+    db.commit()
+
+@dp.message_handler(lambda m: m.text and m.text.lower().startswith("мины"))
+async def mines_start(msg: types.Message):
+    parts = msg.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await msg.reply("Используй: мины 1000")
+        return
+    stake = int(parts[1])
+    uid = msg.from_user.id
+    if stake > get_balance(uid):
+        await msg.reply("❌ Недостаточно валюты")
+        return
+    new_mines(uid, stake)
+    await msg.reply("💣 Минное поле 5×5", reply_markup=mine_keyboard([]))
+
+@dp.callback_query_handler(lambda c: c.data.startswith("mine_") or c.data == "mine_exit")
+async def mine_click(call: types.CallbackQuery):
+    uid = call.from_user.id
+    cur.execute("SELECT cells, opened, stake, multiplier FROM mines WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    if not row:
+        return
+    cells, opened, stake, mult = row
+    cells = cells.split(",")
+    opened = opened.split(",") if opened else []
+
+    if call.data == "mine_exit":
+        win = int(stake * mult)
+        set_balance(uid, get_balance(uid) + win)
+        cur.execute("DELETE FROM mines WHERE user_id=?", (uid,))
+        db.commit()
+        await call.message.reply(f"🏁 Забрал {win} 💰", reply_markup=menu())
+        return
+
+    idx = int(call.data.split("_")[1])
+    if str(idx) in opened:
+        return
+
+    opened.append(str(idx))
+    if cells[idx] == "mine":
+        cur.execute("DELETE FROM mines WHERE user_id=?", (uid,))
+        db.commit()
+        await call.message.reply("💥 МИНА! Ты проиграл", reply_markup=menu())
+        return
+
+    if len(opened) == 1:
+        mult *= 1.8
+    elif len(opened) in (2, 3):
+        mult *= 2
+    else:
+        mult *= 1.5
+
+    cur.execute(
+        "UPDATE mines SET opened=?, multiplier=? WHERE user_id=?",
+        (",".join(opened), mult, uid)
+    )
+    db.commit()
+
+    await call.message.edit_text(
+        f"💣 Минное поле\nМножитель: {mult:.2f}",
+        reply_markup=mine_keyboard(opened)
+    )
+
+# ================== ТОП ==================
+@dp.message_handler(commands=["top"])
+async def top(msg: types.Message):
+    cur.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 5")
+    rows = cur.fetchall()
+    text = "🏆 ТОП ИГРОКОВ\n"
+    for i, r in enumerate(rows, 1):
+        text += f"{i}. {r[1]} 💰\n"
+    await msg.reply(text)
+
+# ================== КНОПКИ ==================
+@dp.callback_query_handler(lambda c: c.data in ["dice", "balance", "mine"])
+async def menu_buttons(call: types.CallbackQuery):
+    uid = call.from_user.id
+    if call.data == "dice":
+        await play_dice(call.message, uid, 10)
+    elif call.data == "balance":
+        await call.message.reply(f"💰 Баланс: {get_balance(uid)}", reply_markup=menu())
+    elif call.data == "mine":
+        await call.message.reply("Напиши: мины 1000")
+    await call.answer()
+
+# ================== ЗАПУСК ==================
+if __name__ == "__main__":
+    executor.start_polling(dp)
